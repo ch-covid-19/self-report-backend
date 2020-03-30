@@ -28,7 +28,14 @@ exports.report = functions.region(REGION).https.onRequest(async (req, res) =>
       console.log('Report request received');
 
       //Front-end will send the token
-      const {token, symptoms, locator, sessionId, diagnostic} = req.body;
+      const {
+        token,
+        symptoms,
+        locator,
+        sessionId,
+        diagnostic,
+        appVersion
+      } = req.body;
       const db = admin.firestore();
 
       if (token === undefined) return res.status(400).send('token is missing');
@@ -68,6 +75,7 @@ exports.report = functions.region(REGION).https.onRequest(async (req, res) =>
             locator,
             sessionId,
             symptoms,
+            appVersion,
             diagnostic,
             timestamp: new Date(),
             score: data.score,
