@@ -14,6 +14,7 @@ const REGION = env.host.region;
 const DB_INDIVIDUAL_REPORT_DEV = env.db.dev;
 const DB_INDIVIDUAL_REPORT = env.db.report;
 const DB_INDIVIDUAL_REPORT_V2 = env.db.report;
+const DB_DAILY_CHANGES = env.db.dailychanges;
 const DB_INDIVIDUAL_REPORT_V2_SUSPICIOUS = env.db.suspicious;
 
 const EXPORT_SECURITY_TOKEN = env.export.token;
@@ -22,6 +23,119 @@ const HTTP_OK = 200;
 
 const RECAPTCHA_SECRET = env.recaptcha.secret;
 const RECAPTCHA_VERIFY_URL = env.recaptcha.verifyurl;
+
+const pad0 = n => n < 10 ? `0${n}` : `${n}`;
+
+const getDayStamp = (date) => date.getFullYear() + '-' + pad0(date.getMonth() + 1) + pad0(date.getDate());
+
+/**
+ * Creates a daily change if doesn't exist or update it to reflect current diagnostic status
+ */
+const updateDailyChange = async (db, postalCode, oldDiagnostic, newDiagnostic) => {
+  const daystamp = getDayStamp(new Date());
+  const currentChangeRef = db.collection(DB_DAILY_CHANGES).doc(`${postalCode}-${daystamp}`);
+  await db.runTransaction(async (transaction) => {
+    const dailyChangeSnapshot = await transaction.get(currentChangeRef);
+    const diagnostics = dailyChangeSnapshot.exists ? dailyChangeSnapshot.data().diagnostics : {};
+
+    // Might be the case if no previous record, so no old diagnostic to erase
+    if (oldDiagnostic !== null) {
+      if (diagnostics[oldDiagnostic] === undefined) diagnostics[oldDiagnostic] = 0;
+      diagnostics[oldDiagnostic] -= 1;
+    }
+
+    if (diagnostics[newDiagnostic] === undefined) diagnostics[newDiagnostic] = 0;
+    diagnostics[newDiagnostic] += 1;
+
+    if (dailyChangeSnapshot.exists) await transaction.update(currentChangeRef, { diagnostics });
+    else {
+      await transaction.set(currentChangeRef, {
+        daystamp,
+        postalCode,
+        diagnostics
+      });
+    }
+  });
+};
+
+exports.daily_report = functions.region(REGION).https.onRequest(async (req, res) => cors(req, res, async () => {
+  console.log('Report request received');
+
+  //Front-end will send the token
+  const {token, symptoms, locator, sessionId, diagnostic} = req.body;
+  const db = admin.firestore();
+
+  if (token === undefined) return res.status(400).send('token is missing');
+  if (locator === undefined) return res.status(400).send('postal code is missing');
+  if (sessionId === undefined) return res.status(400).send('session id is missing');
+  if (isNaN(diagnostic)) return res.status(400).send('diagnostic is missing');
+  console.log('Report data is valid');
+
+  try {
+    console.log('Verifying recaptcha token');
+    const { data: { success, score }} = await axios.post(`${RECAPTCHA_VERIFY_URL}?secret=${RECAPTCHA_SECRET}&response=${token}`, {}, {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"
+      },
+    });
+
+    if (!success) {
+      console.error('recaptcha token is not valid');
+      return res.status(400).send('Recaptcha token is not valid');
+    }
+
+    console.log('recaptcha token is valid, score:', score);
+    const suspicious = score < 0.7;
+    const targetDb = suspicious ? DB_INDIVIDUAL_REPORT_V2_SUSPICIOUS : DB_INDIVIDUAL_REPORT_V2;
+
+    // Update daily changes if legitimate report
+    if (!suspicious) {
+      try {
+        // Retrieve latest change if any
+        const previousStateSnapshot = await db.collection(DB_INDIVIDUAL_REPORT_V2)
+            .where('sessionId', '==', sessionId)
+            .orderBy('timestamp', 'desc')
+            .get();
+
+        // Check if we have a previous record, and update daily change accordingly
+        if (!previousStateSnapshot.empty) {
+          const previousState = previousStateSnapshot.docs[0];
+          // Different diagnostic, update db
+          if (previousState.diagnostic !== diagnostic) {
+            await updateDailyChange(db, locator, previousState.diagnostic, diagnostic);
+          }
+        } else {
+          // No previous record, we simply add the diagnostic to current daily change
+          await updateDailyChange(db, locator, null, diagnostic);
+        }
+      } catch (e) {
+        console.log(e);
+        return res.status(500).end();
+      }
+    }
+
+    // Insert report in db
+    const report = {
+      locator,
+      sessionId,
+      symptoms,
+      diagnostic,
+      timestamp: new Date(),
+      score,
+    };
+
+    console.log('Adding report to DB: ', targetDb, report);
+    await db.collection(targetDb).add(report);
+    res.status(HTTP_OK).send('');
+
+  } catch (e) {
+    console.log(e);
+    res.json(500).end();
+  }
+
+
+
+}));
 
 exports.report = functions.region(REGION).https.onRequest(async (req, res) =>
    cors(req, res, async () => {
