@@ -14,7 +14,8 @@ const REGION = env.host.region;
 const DB_INDIVIDUAL_REPORT_DEV = env.db.dev;
 const DB_INDIVIDUAL_REPORT = env.db.report;
 const DB_INDIVIDUAL_REPORT_V2 = env.db.report;
-const DB_DAILY_CHANGES = env.db.dailychanges;
+const DB_DAILY_CHANGES = env.db.daily_changes;
+const DB_GLOBAL_CHANGES = env.db.global_changes;
 const DB_INDIVIDUAL_REPORT_V2_SUSPICIOUS = env.db.suspicious;
 
 const EXPORT_SECURITY_TOKEN = env.export.token;
@@ -28,33 +29,42 @@ const pad0 = n => n < 10 ? `0${n}` : `${n}`;
 
 const getDayStamp = (date) => date.getFullYear() + '-' + pad0(date.getMonth() + 1) + pad0(date.getDate());
 
+const createOrUpdateChange = async (transaction, postalCode, changeRef, oldDiagnostic, newDiagnostic, baseData) => {
+  const snapshot = await transaction.get(changeRef);
+  const diagnostics = snapshot.exists ? snapshot.data().diagnostics : {};
+
+  // Might be the case if no previous record, so no old diagnostic to erase
+  if (oldDiagnostic !== null) {
+    if (diagnostics[oldDiagnostic] === undefined) diagnostics[oldDiagnostic] = 0;
+    diagnostics[oldDiagnostic] -= 1;
+  }
+
+  if (diagnostics[newDiagnostic] === undefined) diagnostics[newDiagnostic] = 0;
+  diagnostics[newDiagnostic] += 1;
+
+  if (snapshot.exists) await transaction.update(changeRef, { diagnostics });
+  else await transaction.set(changeRef, {
+    ...baseData,
+    diagnostics
+  });
+};
+
 /**
  * Creates a daily change if doesn't exist or update it to reflect current diagnostic status
+ * Also updates global change for NPA
  */
-const updateDailyChange = async (db, postalCode, oldDiagnostic, newDiagnostic) => {
+const firestoreAppendChanges = async (db, postalCode, oldDiagnostic, newDiagnostic) => {
   const daystamp = getDayStamp(new Date());
+  const globalChangeRef = db.collection(DB_GLOBAL_CHANGES).doc(`${postalCode}`);
   const currentChangeRef = db.collection(DB_DAILY_CHANGES).doc(`${postalCode}-${daystamp}`);
+  const baseData = { postalCode };
+
   await db.runTransaction(async (transaction) => {
-    const dailyChangeSnapshot = await transaction.get(currentChangeRef);
-    const diagnostics = dailyChangeSnapshot.exists ? dailyChangeSnapshot.data().diagnostics : {};
-
-    // Might be the case if no previous record, so no old diagnostic to erase
-    if (oldDiagnostic !== null) {
-      if (diagnostics[oldDiagnostic] === undefined) diagnostics[oldDiagnostic] = 0;
-      diagnostics[oldDiagnostic] -= 1;
-    }
-
-    if (diagnostics[newDiagnostic] === undefined) diagnostics[newDiagnostic] = 0;
-    diagnostics[newDiagnostic] += 1;
-
-    if (dailyChangeSnapshot.exists) await transaction.update(currentChangeRef, { diagnostics });
-    else {
-      await transaction.set(currentChangeRef, {
-        daystamp,
-        postalCode,
-        diagnostics
-      });
-    }
+    await createOrUpdateChange(transaction, postalCode, globalChangeRef, oldDiagnostic, newDiagnostic, baseData);
+    await createOrUpdateChange(transaction, postalCode, currentChangeRef, oldDiagnostic, newDiagnostic, {
+      ...baseData,
+      daystamp
+    });
   });
 };
 
@@ -102,11 +112,11 @@ exports.daily_report = functions.region(REGION).https.onRequest(async (req, res)
           const previousState = previousStateSnapshot.docs[0];
           // Different diagnostic, update db
           if (previousState.diagnostic !== diagnostic) {
-            await updateDailyChange(db, locator, previousState.diagnostic, diagnostic);
+            await firestoreAppendChanges(db, locator, previousState.diagnostic, diagnostic);
           }
         } else {
           // No previous record, we simply add the diagnostic to current daily change
-          await updateDailyChange(db, locator, null, diagnostic);
+          await firestoreAppendChanges(db, locator, null, diagnostic);
         }
       } catch (e) {
         console.log(e);
@@ -132,9 +142,6 @@ exports.daily_report = functions.region(REGION).https.onRequest(async (req, res)
     console.log(e);
     res.json(500).end();
   }
-
-
-
 }));
 
 exports.report = functions.region(REGION).https.onRequest(async (req, res) =>
