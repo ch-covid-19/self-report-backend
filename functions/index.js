@@ -27,17 +27,20 @@ const RECAPTCHA_VERIFY_URL = env.recaptcha.verifyurl;
 
 const pad0 = n => n < 10 ? `0${n}` : `${n}`;
 
-const getDayStamp = (date) => date.getFullYear() + '-' + pad0(date.getMonth() + 1) + pad0(date.getDate());
+const getDayStamp = (date) => date.getFullYear() + '-' + pad0(date.getMonth() + 1) + '-' +  pad0(date.getDate());
+const getDailyDocKey = (locator, date) => `${locator}--${getDayStamp(date)}`;
 
-const createOrUpdateChange = async (transaction, changeRef, snapshot, postalCode, oldDiagnostic, newDiagnostic, baseData) => {
+const createOrUpdateChange = async (transaction, changeRef, snapshot, oldState, newState, baseData) => {
   const diagnostics = snapshot.exists ? snapshot.data().diagnostics : {};
 
-  if (oldDiagnostic !== null) {
+  if (oldState !== null) {
+    const oldDiagnostic = oldState.diagnostic;
     if (diagnostics[oldDiagnostic] === undefined) diagnostics[oldDiagnostic] = 0;
     diagnostics[oldDiagnostic] -= 1;
   }
 
-  if (newDiagnostic !== null) {
+  if (newState !== null) {
+    const newDiagnostic = newState.diagnostic;
     if (diagnostics[newDiagnostic] === undefined) diagnostics[newDiagnostic] = 0;
     diagnostics[newDiagnostic] += 1;
   }
@@ -53,38 +56,33 @@ const createOrUpdateChange = async (transaction, changeRef, snapshot, postalCode
  * Creates a daily change if doesn't exist or update it to reflect current diagnostic status
  * Also updates global change for NPA
  */
-const firestoreAppendChanges = async (db, oldPostalCode, postalCode, oldDiagnostic, newDiagnostic) => {
+const firestoreAppendChanges = async (db, oldState, newState) => {
 
-  // const daystamp = getDayStamp(new Date());
-  // const currentChangeRef = db.collection(DB_DAILY_CHANGES).doc(`${postalCode}-${daystamp}`);
+  const now = new Date();
+  const baseData = { locator: newState.locator, daystamp: getDayStamp(now) };
 
-  // If we changed postalCode
-  const previousGlobalChangeRef = oldPostalCode !== postalCode && oldPostalCode !== null ? db.collection(DB_GLOBAL_CHANGES).doc(`${oldPostalCode}`) : null;
-  const currentGlobalChangeRef = db.collection(DB_GLOBAL_CHANGES).doc(`${postalCode}`);
-  const baseData = { postalCode };
+  const previousDocKey = oldState ? getDailyDocKey(oldState.locator, now) : null;
+  const currentDocKey = getDailyDocKey(newState.locator, now);
 
+  // If we updated our diagnostic or npa, reflect it in today's daily changes
+  const previousDailyChangeRef = oldState === null ? null : db.collection(DB_DAILY_CHANGES).doc(previousDocKey);
+  const currentDailyChangeRef = db.collection(DB_DAILY_CHANGES).doc(currentDocKey);
 
   await db.runTransaction(async (transaction) => {
 
-    const currentGlobalSnapshot = await transaction.get(currentGlobalChangeRef);
+    const currentDailySnapshot = await transaction.get(currentDailyChangeRef);
 
     // If we have to deal with another postal code, first update previous then update newest
-    if (previousGlobalChangeRef) {
-      console.log("Has previous change ref (thus different locator), update old and new global change", oldPostalCode, postalCode);
-      const previousGlobalSnapshot = await transaction.get(previousGlobalChangeRef);
-      await createOrUpdateChange(transaction, previousGlobalChangeRef, previousGlobalSnapshot, oldPostalCode, oldDiagnostic, null, baseData);
-      await createOrUpdateChange(transaction, currentGlobalChangeRef, currentGlobalSnapshot, postalCode, null, newDiagnostic, baseData);
+    // Only if npa changed, otherwise we can only do 1 doc update/write
+    if (previousDailyChangeRef && previousDocKey !== currentDocKey) {
+      console.log("Different NPA when reporting status");
+      const previousDailySnapshot = await transaction.get(previousDailyChangeRef);
+      await createOrUpdateChange(transaction, previousDailyChangeRef, previousDailySnapshot, oldState, null, baseData);
+      await createOrUpdateChange(transaction, currentDailyChangeRef, currentDailySnapshot, null, newState, baseData);
     } else {
-      console.log('no previous change ref', oldPostalCode, postalCode);
-      await createOrUpdateChange(transaction, currentGlobalChangeRef, currentGlobalSnapshot, postalCode, oldDiagnostic, newDiagnostic, baseData);
+      // Only update current daily change because either same NPA or no previous daily change
+      await createOrUpdateChange(transaction, currentDailyChangeRef, currentDailySnapshot, oldState, newState, baseData);
     }
-    // For now we don't need to calculate every dailychange, only keep latest up to date, all daily are calculable from all reports
-    /*
-    await createOrUpdateChange(transaction, postalCode, currentChangeRef, oldDiagnostic, newDiagnostic, {
-      ...baseData,
-      daystamp
-    });
-     */
   });
 };
 
@@ -132,18 +130,14 @@ exports.daily_report = functions.region(REGION).https.onRequest(async (req, res)
         // Check if we have a previous record, and update daily change accordingly
         if (!previousStateSnapshot.empty) {
           const previousState = previousStateSnapshot.docs[0].data();
-          console.log("previous state", previousState);
-          console.log(previousState.diagnostic, diagnostic, previousState.locator, locator, previousState.diagnostic !== diagnostic || previousState.locator !== locator);
 
-          // Different diagnostic, update db
+          // Different diagnostic or npa, update db
           if (previousState.diagnostic !== diagnostic || previousState.locator !== locator) {
-            console.log('different npa or diagnostic');
-            await firestoreAppendChanges(db, previousState.locator, locator, previousState.diagnostic, diagnostic);
+            await firestoreAppendChanges(db, previousState, { locator, diagnostic });
           }
         } else {
-          console.log('no previous change');
           // No previous record, we simply add the diagnostic to current daily change
-          await firestoreAppendChanges(db, null, locator, null, diagnostic);
+          await firestoreAppendChanges(db, null, { locator, diagnostic });
         }
       } catch (e) {
         console.log(e);
@@ -171,18 +165,23 @@ exports.daily_report = functions.region(REGION).https.onRequest(async (req, res)
   }
 }));
 
-exports.aggregated_csv = functions.region(REGION).https.onRequest( async (req, res) => cors(req, res, async () => {
+exports.daily_json = functions.region(REGION).https.onRequest( async (req, res) => cors(req, res, async () => {
 
   if (!['GET', 'POST'].includes(req.method)) {
     res.status(400).json({"error": "Wrong HTTP Method used"});
   }
 
-  if (req.query.token !== EXPORT_SECURITY_TOKEN) {
+  const { token, date } = req.query;
+  if (token !== EXPORT_SECURITY_TOKEN) {
     res.status(401).json({"error": "Invalid security token"});
   }
 
+  const daystamp = date ? date : getDayStamp(new Date());
   const db = admin.firestore();
-  db.collection(DB_GLOBAL_CHANGES)
+
+  console.log('retrieving daily changes for ' + daystamp);
+  db.collection(DB_DAILY_CHANGES)
+      .where('daystamp', '==', daystamp)
       .get().then(snapshot => res.status(200).json(snapshot.docs.map(doc => doc.data())))
       .catch(err => {
         console.log('Error getting documents', err);
