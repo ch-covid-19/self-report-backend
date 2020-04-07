@@ -165,17 +165,101 @@ exports.daily_report = functions.region(REGION).https.onRequest(async (req, res)
   }
 }));
 
-exports.daily_json = functions.region(REGION).https.onRequest( async (req, res) => cors(req, res, async () => {
+const authenticate = (req, res) => {
+  let ok = true;
 
   if (!['GET', 'POST'].includes(req.method)) {
     res.status(400).json({"error": "Wrong HTTP Method used"});
+    ok = false;
   }
 
-  const { token, date } = req.query;
-  if (token !== EXPORT_SECURITY_TOKEN) {
+  if (req.query.token !== EXPORT_SECURITY_TOKEN) {
     res.status(401).json({"error": "Invalid security token"});
+    ok = false;
   }
 
+  return ok;
+};
+
+exports.build_daily_changes = functions.region(REGION).https.onRequest(async (req, res) => cors(req, res, async () => {
+  if (!authenticate(req, res)) return;
+  const db = admin.firestore();
+
+  // get all reports
+  const reports = await db.collection(DB_INDIVIDUAL_REPORT_V2)
+      .orderBy('timestamp', 'asc')
+      .get();
+
+  // build daily changes
+  const dailyChanges = new Map();
+
+  // Keeps each user previous report to change if necessary
+  const userPreviousState = new Map();
+  reports.docs.forEach((item) => {
+    const { locator, sessionId, diagnostic, timestamp } = item.data();
+    const dateTimestamp = new Date(timestamp.toDate());
+    const key = getDailyDocKey(locator, dateTimestamp);
+    const dailyChange = dailyChanges.has(key) ? dailyChanges.get(key) : {
+      daystamp: getDayStamp(dateTimestamp),
+      diagnostics: {},
+      locator,
+    };
+
+
+    if (userPreviousState.has(sessionId)) {
+      let downGradedDailyChange = dailyChange;
+      const previousState = userPreviousState.get(sessionId);
+      const downGradedKey = getDailyDocKey(previousState.locator, dateTimestamp);
+
+      // User previously reported on different postal code
+      if (locator !== previousState.locator) {
+        downGradedDailyChange = dailyChanges.has(downGradedKey) ? dailyChanges.get(downGradedKey) : {
+          locator: previousState.locator,
+          daystamp: getDayStamp(dateTimestamp),
+          diagnostics: {}
+        };
+      }
+
+      // Downgrade previous state diagnostic
+      if (downGradedDailyChange.diagnostics[previousState.diagnostic] === undefined) downGradedDailyChange.diagnostics[previousState.diagnostic] = 0;
+      downGradedDailyChange.diagnostics[previousState.diagnostic] -= 1;
+
+      // Update down graded daily change
+      dailyChanges.set(downGradedKey, downGradedDailyChange);
+    }
+
+    // Increment daily change diagnostic
+    if (dailyChange.diagnostics[diagnostic] === undefined) dailyChange.diagnostics[diagnostic] = 0;
+    dailyChange.diagnostics[diagnostic] += 1;
+
+    // Update daily changes
+    dailyChanges.set(key, dailyChange);
+
+    // add diagnostic mapped to user session
+    userPreviousState.set(sessionId, { diagnostic, locator });
+  });
+
+  // Write all daily changes to firestore
+  const batch = db.batch();
+  for ([docKey, docContent] of dailyChanges) {
+    const ref = db.collection(DB_DAILY_CHANGES).doc(docKey);
+    batch.set(ref, docContent);
+  }
+
+  try {
+    await batch.commit();
+    res.status(200).json({ message: `Wrote ${dailyChanges.size} daily changes to DB` });
+  } catch (e) {
+    console.log(e);
+    res.status(500).end();
+  }
+}));
+
+exports.daily_json = functions.region(REGION).https.onRequest( async (req, res) => cors(req, res, async () => {
+
+  if (!authenticate(req, res)) return;
+
+  const { date } = req.query;
   const daystamp = date ? date : getDayStamp(new Date());
   const db = admin.firestore();
 
