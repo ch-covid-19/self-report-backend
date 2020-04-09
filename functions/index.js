@@ -15,7 +15,6 @@ const DB_INDIVIDUAL_REPORT_DEV = env.db.dev;
 const DB_INDIVIDUAL_REPORT = env.db.report;
 const DB_INDIVIDUAL_REPORT_V2 = env.db.report;
 const DB_DAILY_CHANGES = env.db.daily_changes;
-const DB_GLOBAL_CHANGES = env.db.global_changes;
 const DB_INDIVIDUAL_REPORT_V2_SUSPICIOUS = env.db.suspicious;
 
 const EXPORT_SECURITY_TOKEN = env.export.token;
@@ -86,7 +85,7 @@ const firestoreAppendChanges = async (db, oldState, newState) => {
   });
 };
 
-exports.daily_report = functions.region(REGION).https.onRequest(async (req, res) => cors(req, res, async () => {
+exports.report = functions.region(REGION).https.onRequest(async (req, res) => cors(req, res, async () => {
   console.log('Report request received');
 
   //Front-end will send the token
@@ -121,7 +120,7 @@ exports.daily_report = functions.region(REGION).https.onRequest(async (req, res)
       console.log('not suspicious');
       try {
         // Retrieve latest change if any
-        const previousStateSnapshot = await db.collection(DB_INDIVIDUAL_REPORT_V2)
+        const previousStateSnapshot = await db.collection(targetDb)
             .where('sessionId', '==', sessionId)
             .orderBy('timestamp', 'desc')
             .limit(1)
@@ -185,18 +184,29 @@ exports.build_daily_changes = functions.region(REGION).https.onRequest(async (re
   if (!authenticate(req, res)) return;
   const db = admin.firestore();
 
-  // get all reports
-  const reports = await db.collection(DB_INDIVIDUAL_REPORT_V2)
-      .orderBy('timestamp', 'asc')
-      .get();
+  const { collections } = req.query;
+  if (collections === undefined) return res.status(400).json({ message: "Missing collections argument" });
+
+  console.log('Starting job with collections: ', collections.split(','));
+
+  // We have to build all reports every time even when date change to make sure we take care of previous reports
+  const reports = [];
+  await collections.split(',').reduce((acc, colName) => acc.then(() => new Promise((resolve) => {
+    db.collection(colName).orderBy('timestamp', 'asc').get().then((snapshot) => {
+      snapshot.docs.forEach((item) => {
+        reports.push(item.data());
+      });
+      resolve();
+    });
+  })), Promise.resolve());
 
   // build daily changes
   const dailyChanges = new Map();
 
   // Keeps each user previous report to change if necessary
   const userPreviousState = new Map();
-  reports.docs.forEach((item) => {
-    const { locator, sessionId, diagnostic, timestamp } = item.data();
+  reports.forEach(({ locator, sessionId, diagnostic, timestamp }) => {
+    if (locator === undefined || sessionId === undefined || diagnostic === undefined || timestamp === undefined) return;
     const dateTimestamp = new Date(timestamp.toDate());
     const key = getDailyDocKey(locator, dateTimestamp);
     const dailyChange = dailyChanges.has(key) ? dailyChanges.get(key) : {
@@ -204,7 +214,6 @@ exports.build_daily_changes = functions.region(REGION).https.onRequest(async (re
       diagnostics: {},
       locator,
     };
-
 
     if (userPreviousState.has(sessionId)) {
       let downGradedDailyChange = dailyChange;
@@ -239,20 +248,31 @@ exports.build_daily_changes = functions.region(REGION).https.onRequest(async (re
     userPreviousState.set(sessionId, { diagnostic, locator });
   });
 
-  // Write all daily changes to firestore
-  const batch = db.batch();
-  for ([docKey, docContent] of dailyChanges) {
-    const ref = db.collection(DB_DAILY_CHANGES).doc(docKey);
-    batch.set(ref, docContent);
-  }
+  // Write all daily changes to firestore per batch of size 500 every second to avoid reaching limit
+  const dailyChangesArray = Array.from(dailyChanges);
+  const batchs = Math.ceil(dailyChangesArray.length / 500);
 
-  try {
-    await batch.commit();
-    res.status(200).json({ message: `Wrote ${dailyChanges.size} daily changes to DB` });
-  } catch (e) {
-    console.log(e);
-    res.status(500).end();
-  }
+  await [...Array(batchs).keys()].reduce((acc, batchId) => acc.then(() => new Promise((resolve) => {
+    const itemsToTreat = dailyChangesArray.slice(batchId * 500, (batchId + 1)*500);
+    const batch = db.batch();
+    itemsToTreat.forEach(([docKey, docContent]) => {
+      const ref = db.collection(DB_DAILY_CHANGES).doc(docKey);
+      batch.set(ref, docContent);
+    });
+    batch.commit().then(() => {
+      resolve();
+    }).catch((err) => {
+      res.status(500).json({
+        message: err.message,
+        reports: reports.length,
+        batchs,
+      });
+      process.exit(10);
+    });
+  })), Promise.resolve());
+
+
+  res.status(200).json({ message: "Done generating daily changes :)", reports: reports.length, batchs });
 }));
 
 exports.daily_json = functions.region(REGION).https.onRequest( async (req, res) => cors(req, res, async () => {
@@ -272,108 +292,3 @@ exports.daily_json = functions.region(REGION).https.onRequest( async (req, res) 
         res.status(400).json({"error": "Error getting documents"})
       });
 }));
-
-
-
-
-
-
-
-
-
-exports.report = functions.region(REGION).https.onRequest(async (req, res) =>
-   cors(req, res, async () => {
-      console.log('Report request received');
-
-      //Front-end will send the token
-      const {token, symptoms, locator, sessionId, diagnostic} = req.body;
-      const db = admin.firestore();
-
-      if (token === undefined) return res.status(400).send('token is missing');
-      if (locator === undefined) return res.status(400).send('postal code is missing');
-      if (sessionId === undefined) return res.status(400).send('session id is missing');
-      if (diagnostic === undefined) return res.status(400).send('diagnostic is missing');
-
-      console.log('Report data is valid');
-
-      try {
-        console.log('Verifying recaptcha token');
-        const response = await axios.post(
-            `${RECAPTCHA_VERIFY_URL}?secret=${RECAPTCHA_SECRET}&response=${token}`,
-            {},
-            {
-              headers: {
-                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"
-              },
-            },
-        );
-
-        const data = response.data;
-        console.log('Token verification finished', data);
-
-        if (!data.success) {
-          console.error('recaptcha token is not valid');
-          return res.status(400).send('Recaptcha token is not valid');
-        }
-
-        console.log('recaptcha token is valid, score:', data.score);
-        const suspicious = data.score < 0.7;
-
-        const targetDb = suspicious ? DB_INDIVIDUAL_REPORT_V2_SUSPICIOUS : DB_INDIVIDUAL_REPORT_V2;
-
-        try {
-          const report = {
-            locator,
-            sessionId,
-            symptoms,
-            diagnostic,
-            timestamp: new Date(),
-            score: data.score,
-          };
-          console.log('Adding report to DB: ', targetDb, report);
-          await db.collection(targetDb).add(report);
-
-          console.log('Report added');
-          res.status(HTTP_OK).send('');
-
-        } catch (error) {
-          console.log('Error adding the report to the database', error);
-          res.status(500).send(`Could not register your report: ${error}`);
-        }
-
-      } catch (error) {
-        console.log('error during recaptcha verification', error);
-        res.status(500).send(error);
-      }
-    })
-);
-
-
-exports.export_json = functions.region(REGION).https.onRequest((req, res) => {
-
-  if (req.method !== 'GET') {
-    res.status(400).json({"error": "Wrong HTTP Method used"});
-  }
-
-  const { start, end, token } = req.query;
-
-  if (end === undefined) return res.status(400).send('end is missing');
-  if (start === undefined) return res.status(400).send('start is missing');
-
-  if (token !== EXPORT_SECURITY_TOKEN) {
-    res.status(401).json({"error": "Invalid security token"});
-  }
-
-  const db = admin.firestore();
-  db.collection(DB_INDIVIDUAL_REPORT)
-      .where('timestamp', '>=', new Date(start))
-      .where('timestamp', '<', new Date(end))
-      .get().then(snapshot => {
-        if (snapshot.empty) res.status(404).json({"error": "Empty collection"});
-        else res.status(200).json(snapshot.docs.map((doc) => ({ id: doc.id, data: doc.data() })));
-      })
-      .catch(err => {
-        console.log('Error getting documents', err);
-        res.status(400).json({"error": "Error getting documents"})
-      });
-});
