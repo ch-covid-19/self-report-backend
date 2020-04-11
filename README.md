@@ -1,8 +1,9 @@
 # self-report backend
 
-Firebase function for covid-self-report.
+Firebase functions for covid-self-report.
 
-This firebase function will validate request using Google's reCaptcha v3 before inserting data into firestore, you must as such create a reCaptcha project (if you want to use it) and have firestore available in your Firebase project.
+## Migrating from v0.0.1
+Please follow the migration guide in MIGRATION.md
 
 ## Getting started
 1. Create a firebase project if not already done
@@ -18,16 +19,17 @@ You have to manually create a `/functions/.runtimeconfig.json` file and set your
 {
   "host": {
     "domain": "", // Currently unused
-    "region": "europe-west1" // Firebase region of hosting
+    "region": "" // Firebase region of hosting
   },
   "recaptcha": {
     "secret": "", // Recaptcha secret value (not public key)
     "verifyurl": "https://recaptcha.google.com/recaptcha/api/siteverify"
   },
   "db": {
-    "report": "", // firestore collection in which legitimate reports go
-    "suspicious": "", // firestore collection in which suspicious reports go
-    "dev": "" // firestore collection used in development, currently not used
+    "report": "individual-report",
+    "suspicious": "individual-report-suspicious",
+    "dev": "individual-report-development",
+    "daily_changes": "daily-changes"
   },
   "export": {
     "token": "" // A token you can set to whatever value (we recommand using https://passwordsgenerator.net/ to generate a secure hash) this will be used to secure the export_json function
@@ -58,13 +60,12 @@ service cloud.firestore {
 These rules make sure only admin can perform CRUD operations on your firestore, which is the case when a function is run. This ensures no one except your functions can access your firestore.
 
 ### Indexes
-We encourage you to add indexes to your firestore collections, most importantly on the report collection. One index we put which seems to be effective is the following:
-- Timestamp ASC
-- Locator ASC
-- diagnostic ASC
+Your report collection requires an index to work:
+- sessionId: ascending
+- timestamp: descending
 
 
-### Using firebase.json (optional)
+### Using firebase.json to deploy frontend (optional)
 Your `.firebase.json` file contains metadata about the project, including valuable informations if you want to host the frontend on Firebase. For it, you can use this simple configuration:
 ```json
 {
