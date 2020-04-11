@@ -3,7 +3,7 @@
 Firebase functions for covid-self-report.
 
 ## Migrating from v0.0.1
-Please follow the migration guide in MIGRATION.md
+Please follow the migration guide in [MIGRATION.md](https://github.com/ch-covid-19/self-report-backend/blob/master/MIGRATION.md)
 
 ## Getting started
 1. Create a firebase project if not already done
